@@ -1,0 +1,14 @@
+venv
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+node_modules
+frontend_bad/node_modules
+frontend_bad/dist
+.idea
+db.sqlite3
+tmpbot/
+run.txt
+node_modules/

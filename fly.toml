@@ -1,0 +1,24 @@
+app = "communipay"
+primary_region = "fra"
+
+[env]
+  PORT = "8080"
+  DJANGO_SETTINGS_MODULE = "apiCommuniPay.settings"
+
+[processes]
+  web = ""   # запуск берется из CMD вашего Dockerfile (supervisord, nginx+gunicorn)
+
+[http_service]
+  processes = ["web"]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = true
+  min_machines_running = 1
+
+[deploy]
+  release_command = "/usr/bin/env DJANGO_SETTINGS_MODULE=apiCommuniPay.settings /venv/bin/python manage.py migrate --noinput"
+
+
+[[vm]]
+  size = "shared-cpu-1x"
