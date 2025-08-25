@@ -9,11 +9,14 @@ User = get_user_model()
 class ProjectMemberSerializer(serializers.ModelSerializer):
     user_email = serializers.EmailField(source="user.email", read_only=True)
     user_name = serializers.CharField(source="user.get_full_name", read_only=True)
-
+    tg_id = serializers.SerializerMethodField()
     class Meta:
         model = ProjectMember
-        fields = ["id", "user", "user_email", "user_name", "role", "joined_at"]
-        read_only_fields = ["id", "joined_at", "user_email", "user_name"]
+        fields = ["id", "user", "user_email", "user_name", "role", "joined_at","tg_id"]
+        read_only_fields = ["id", "joined_at", "user_email", "user_name", "tg_id"]
+    def get_tg_id(self, obj):
+        # Получаем telegram_id пользователя, связанного с членом проекта
+        return obj.user.telegram_id if obj.user else None
 
 
 class ProjectSerializer(serializers.ModelSerializer):

@@ -38,7 +38,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             return [IsAuthenticated(), CanManageProject()]
         return [IsAuthenticated()]
 
-    @action(methods=["get"], detail=True, url_path="members")
+    @action(methods=["get"], detail=True, url_path="members-list")
     def members(self, request, id=None):
         project = self.get_object()
         qs = project.memberships.select_related("user").order_by("joined_at")

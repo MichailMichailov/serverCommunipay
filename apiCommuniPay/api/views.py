@@ -66,10 +66,16 @@ class RegisterView(views.APIView):
         return response.Response({"id": user.id, "username": user.username}, status=status.HTTP_201_CREATED)
 
 class MeSerializer(serializers.ModelSerializer):
+    bot = serializers.SerializerMethodField()
     class Meta:
         model = User
-        fields = ("id", "username", "email", "first_name", "last_name", "role")
+        fields = ("id", "username", "email", "first_name", "last_name", "role", "bot")
         read_only_fields = ("id", "username", "role")
+    def get_bot(self, obj):
+        return {
+            "name": getattr(settings, "TELEGRAM_BOT_USERNAME", ""),
+            "token": getattr(settings, "TELEGRAM_BOT_TOKEN", "")
+        }
 
 class MeView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
