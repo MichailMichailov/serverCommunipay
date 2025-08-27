@@ -1,184 +1,258 @@
 # apiCommuniPay/common/webhook.py
-import random, json, logging
+import json
+
 import requests
 from django.conf import settings
-from django.http import HttpResponse, JsonResponse
-from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse, HttpResponseForbidden
 from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+
 from .models import ChatLinkIntent, TelegramChat
 
-log = logging.getLogger(__name__)
+_TELEGRAM_BOT_ID = getattr(settings, "TELEGRAM_BOT_ID", None)
+TELEGRAM_BOT_ID = int(_TELEGRAM_BOT_ID) if _TELEGRAM_BOT_ID not in (None, "") else None
 
-BOT_TOKEN = settings.TELEGRAM_BOT_TOKEN
-BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-WEBHOOK_SECRET = settings.TELEGRAM_WEBHOOK_SECRET  # рандомная строка в env
+WEBHOOK_SECRET  = getattr(settings, "TELEGRAM_WEBHOOK_SECRET")
+BOT_TOKEN       = getattr(settings, "TELEGRAM_BOT_TOKEN", None)
 
-def tg_api(method: str, **params):
-    r = requests.post(f"{BOT_API}/{method}", json=params, timeout=10)
+TG_API = "https://api.telegram.org"
+
+def _ok():
+    return JsonResponse({"ok": True})
+
+def _tg_api(method: str, **params):
+    """Мини-обёртка над Telegram Bot API (используем только для getChat)."""
+    if not BOT_TOKEN:
+        return {}
+    url = f"{TG_API}/bot{BOT_TOKEN}/{method}"
+    r = requests.post(url, json=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("result", {}) if data.get("ok") else {}
+
+def _get_chat_flags(chat_id: int) -> dict:
+    """
+    Возвращает {'join_by_request': bool} по данным getChat.
+    Если токена нет или ошибка — считаем False.
+    """
     try:
-        data = r.json()
+        info = _tg_api("getChat", chat_id=chat_id) or {}
+        return {"join_by_request": bool(info.get("join_by_request", False))}
     except Exception:
-        log.exception("Telegram response is not JSON: %s", r.text[:2000])
-        raise
-    if not data.get("ok"):
-        log.error("Telegram API error: %s", data)
-    return data
-
-def _reply_markup_with_request_chat(request_id: int):
-    # KeyboardButton with request_chat (работает в приватном чате с ботом)
-    return {
-        "keyboard": [[{
-            "text": "Выбрать чат/канал",
-            "request_chat": {
-                "request_id": request_id,
-                "chat_is_channel": True,           # можно выбрать канал
-                "chat_is_forum": False,
-                "bot_administrator_rights": {      # какие права хотим в супергруппе
-                    "can_manage_chat": True,
-                    "can_delete_messages": True,
-                    "can_invite_users": True,
-                    "can_restrict_members": True,
-                    "can_pin_messages": True,
-                    "can_manage_topics": True
-                },
-                "bot_is_member": True              # бот должен быть участником (для групп)
-            }
-        }]],
-        "resize_keyboard": True,
-        "one_time_keyboard": True,
-        "is_persistent": False
-    }
-
-def _upsert_chat(chat_id: int, meta: dict, project=None, added_by=None, status=None):
-    tc, _ = TelegramChat.objects.get_or_create(tg_id=chat_id, defaults={
-        "type": meta.get("type", "channel"),
-        "title": meta.get("title") or "",
-        "username": meta.get("username") or "",
-        "project": project,
-        "added_by": added_by or None,
-    })
-    changed = False
-    for fld, val in (
-        ("type", meta.get("type") or tc.type),
-        ("title", meta.get("title") or tc.title),
-        ("username", meta.get("username") or tc.username),
-    ):
-        if getattr(tc, fld) != val:
-            setattr(tc, fld, val)
-            changed = True
-    if project and tc.project_id != project.id:
-        tc.project = project
-        changed = True
-    if added_by and tc.added_by != added_by:
-        tc.added_by = added_by
-        changed = True
-    if status and tc.status != status:
-        tc.status = status
-        changed = True
-    if changed:
-        tc.save()
-    return tc
+        return {"join_by_request": False}
 
 @csrf_exempt
+@require_POST
 def telegram_webhook_view(request, secret: str):
+    # 1) защита секретом в path (+ опционально заголовок от Telegram)
     if secret != WEBHOOK_SECRET:
-        return HttpResponse(status=403)
+        return HttpResponseForbidden("bad secret in path")
+    hdr_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if hdr_secret and hdr_secret != WEBHOOK_SECRET:
+        return HttpResponseForbidden("bad secret header")
 
     try:
         update = json.loads(request.body.decode("utf-8"))
     except Exception:
-        return HttpResponse(status=400)
+        return _ok()
 
-    # 1) /start proj_xxx
-    msg = update.get("message")
-    if msg and "text" in msg:
-        text: str = msg["text"]
-        if text.startswith("/start"):
-            parts = text.split(maxsplit=1)
-            payload = parts[1] if len(parts) > 1 else ""
-            chat_id = msg["chat"]["id"]
-            from_id = msg["from"]["id"]
+    if (m := update.get("my_chat_member")):
+        return _handle_my_chat_member(m)
+    if (msg := update.get("message")):
+        return _handle_message(msg)
 
-            if payload.startswith("proj_"):
-                # находим активное намерение
-                intent = ChatLinkIntent.objects.filter(token=payload, status=ChatLinkIntent.Status.PENDING).first()
-                if not intent or not intent.is_active():
-                    tg_api("sendMessage", chat_id=chat_id, text="Ссылка устарела. Повторите подключение из мини-аппа.")
-                    return JsonResponse({"ok": True})
+    return _ok()
 
-                # помечаем кто нажал start
-                if intent.tg_user_id != from_id:
-                    intent.tg_user_id = from_id
 
-                # создаём request_id для chat_shared
-                if not intent.tg_request_id:
-                    intent.tg_request_id = random.randint(10_000, 2_000_000_000)
-                intent.save(update_fields=["tg_user_id", "tg_request_id"])
+# ---------- message handlers ----------
 
-                tg_api("sendMessage",
-                      chat_id=chat_id,
-                      text="Теперь выберите канал/чат и добавьте меня админом.\n"
-                           "Либо вручную: откройте нужный канал → Администраторы → добавить бота.",
-                      reply_markup=_reply_markup_with_request_chat(intent.tg_request_id))
-                return JsonResponse({"ok": True})
+def _handle_message(msg: dict):
+    """ /start <token>, chat_shared """
+    from_user = (msg.get("from") or {})
+    from_id   = from_user.get("id")
 
-    # 2) chat_shared (после нажатия «Выбрать чат/канал»)
-    if msg and "chat_shared" in msg:
-        shared = msg["chat_shared"]
-        req_id = shared.get("request_id")
-        shared_chat_id = shared.get("chat_id")
-        from_id = msg["from"]["id"]
+    # a) /start <token>
+    text = msg.get("text") or ""
+    if text.startswith("/start "):
+        token = text.split(" ", 1)[1].strip()
+        _touch_start_token(token, from_id)
+        return _ok()
 
-        intent = ChatLinkIntent.objects.filter(tg_request_id=req_id, status=ChatLinkIntent.Status.PENDING).first()
-        if not intent or not intent.is_active():
-            return JsonResponse({"ok": True})
+    # b) chat_shared (пользователь «поделился чатом» из Telegram)
+    if "chat_shared" in msg:
+        cs        = msg["chat_shared"]
+        chat_id   = cs.get("chat_id")
+        req_id    = cs.get("request_id")
+        _handle_chat_shared(from_id, req_id, chat_id)
+        return _ok()
 
-        # предварительно создаём запись чата со статусом "требуются права"
-        meta = {}
-        _upsert_chat(shared_chat_id, meta, project=None, added_by=from_id, status=TelegramChat.ChatStatus.PENDING_RIGHTS)
+    return _ok()
 
-        # просим дать права и добавить бота админом
-        tg_api("sendMessage", chat_id=msg["chat"]["id"],
-               text="Почти готово! Добавьте бота админом в выбранный канал/чат.\n"
-                    "Как только бот станет админом, канал привяжется к проекту.")
 
-        # запомним chat_id в намерении (финализируем при my_chat_member)
-        intent.chat_id = shared_chat_id
-        intent.save(update_fields=["chat_id"])
-        return JsonResponse({"ok": True})
+def _touch_start_token(token: str, from_id: int | None):
+    if not token or not from_id:
+        return
+    intent = (ChatLinkIntent.objects
+              .filter(token=token, status=ChatLinkIntent.Status.PENDING,
+                      expires_at__gt=timezone.now())
+              .order_by("-created_at").first())
+    if not intent:
+        return
+    # Запомним, кто нажал /start (для дальнейшего сопоставления)
+    if intent.tg_user_id != from_id:
+        intent.tg_user_id = from_id
+        intent.save(update_fields=["tg_user_id"])
 
-    # 3) my_chat_member (бот стал админом в каком-то чате)
-    mcm = update.get("my_chat_member")
-    if mcm:
-        chat = mcm.get("chat") or {}
-        new = mcm.get("new_chat_member") or {}
-        actor = mcm.get("from") or {}
-        status = new.get("status")
-        bot_user = new.get("user") or {}
-        if status == "administrator" and bot_user.get("is_bot"):
-            chat_id = chat.get("id")
-            actor_id = actor.get("id")  # кто добавил
-            # найдём ближайшее активное намерение этого человека
-            intent = (ChatLinkIntent.objects
-                      .filter(status=ChatLinkIntent.Status.PENDING,
-                              tg_user_id=actor_id,
-                              expires_at__gt=timezone.now())
-                      .order_by("-created_at")
-                      .first())
-            # получим метаинфо о чате (best-effort)
-            meta = {"type": chat.get("type"), "title": chat.get("title"), "username": chat.get("username")}
 
-            if intent:
-                tc = _upsert_chat(chat_id, meta, project=intent.project, added_by=actor_id, status=TelegramChat.ChatStatus.ACTIVE)
-                intent.mark_consumed(chat_id=chat_id)
-                # уведомим в ЛС
-                tg_api("sendMessage", chat_id=actor_id,
-                       text=f"Канал/чат '{tc.title or tc.username or tc.tg_id}' привязан к проекту «{intent.project.name}». "
-                            f"Откройте мини-апп, чтобы управлять.")
-            else:
-                # нет намерения — просто сохраним как найденный (без проекта)
-                _upsert_chat(chat_id, meta, project=None, added_by=actor_id, status=TelegramChat.ChatStatus.ACTIVE)
+def _handle_chat_shared(from_id: int | None, req_id: int | None, chat_id: int | None):
+    """Помечаем чат как «ожидает права», линкуем к проекту из активного intent этого пользователя"""
+    if not (from_id and chat_id):
+        return
+    intent = (_find_active_intent_for_user(from_id) or
+              _find_active_intent_for_request(req_id))
+    if not intent:
+        return
 
-        return JsonResponse({"ok": True})
+    # upsert TelegramChat, но статус пока PENDING_RIGHTS (права ещё не выданы)
+    chat, _ = TelegramChat.objects.update_or_create(
+        tg_id=chat_id,
+        defaults={
+            "type": TelegramChat.ChatType.SUPERGROUP,   # обязательное поле в модели
+            "title": "",
+            "username": "",
+            "project": intent.project,
+            "status": TelegramChat.ChatStatus.PENDING_RIGHTS,
+            "added_by": from_id,
+        },
+    )
+    # сохраним request_id и chat_id в intent и закроем его (consumed)
+    if intent.tg_request_id != req_id:
+        intent.tg_request_id = req_id
+    intent.mark_consumed(chat_id=chat_id)
 
-    return JsonResponse({"ok": True})
+
+# ---------- my_chat_member (когда бота сделали админом) ----------
+
+def _handle_my_chat_member(mcm: dict):
+    chat      = mcm.get("chat") or {}
+    new_cm    = mcm.get("new_chat_member") or {}
+    actor     = mcm.get("from") or {}
+    bot_user  = (new_cm.get("user") or {})
+
+    # обрабатываем только событие про бота; если TELEGRAM_BOT_ID задан — сверяем
+    if not bot_user.get("is_bot"):
+        return _ok()
+    if TELEGRAM_BOT_ID is not None and int(bot_user.get("id")) != TELEGRAM_BOT_ID:
+        return _ok()
+
+    new_status = new_cm.get("status")
+    try:
+        chat_id = int(chat["id"])
+    except (KeyError, TypeError, ValueError):
+        return _ok()
+    chat_type  = chat.get("type")
+    title      = chat.get("title") or chat.get("username") or str(chat_id)
+    actor_id   = actor.get("id")
+
+    # права админа бота: важно can_invite_users
+    can_invite = bool(new_cm.get("can_invite_users", False))
+    flags = _get_chat_flags(chat_id)
+    join_by_request = bool(flags.get("join_by_request", False))
+
+    # рассчёт статуса
+    if new_status == "administrator":
+        new_db_status = TelegramChat.ChatStatus.ACTIVE if can_invite else TelegramChat.ChatStatus.PENDING_RIGHTS
+    elif new_status in ("member", "restricted"):
+        new_db_status = TelegramChat.ChatStatus.PENDING_RIGHTS
+    elif new_status in ("left", "kicked"):
+        new_db_status = TelegramChat.ChatStatus.INACTIVE
+    else:
+        return _ok()
+
+    # upsert записи о чате + фиксация флагов
+    chat_obj, created = TelegramChat.objects.update_or_create(
+        tg_id=chat_id,
+        defaults={
+            "type": chat_type or TelegramChat.ChatType.SUPERGROUP,
+            "title": title,
+            "username": chat.get("username") or "",
+            "status": new_db_status,
+            "added_by": actor_id,
+            "can_invite_users": can_invite,
+            "join_by_request": join_by_request,
+        },
+    )
+    # отметим время синхронизации
+    TelegramChat.objects.filter(pk=chat_obj.pk).update(last_synced_at=timezone.now())
+
+    # если бот стал админом — попробуем привязать к проекту по intent
+    if new_status == "administrator":
+        _link_chat_to_project(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            title=title,
+            actor_id=actor_id,
+            status=new_db_status,
+            can_invite_users=can_invite,
+            join_by_request=join_by_request,
+        )
+    return _ok()
+
+
+
+def _link_chat_to_project(
+    chat_id: int,
+    chat_type: str | None,
+    title: str,
+    actor_id: int | None,
+    status: str,
+    can_invite_users: bool,
+    join_by_request: bool,
+):
+    intent = _find_active_intent_for_user(actor_id) or (
+        ChatLinkIntent.objects
+        .filter(chat_id=chat_id, status=ChatLinkIntent.Status.PENDING, expires_at__gt=timezone.now())
+        .order_by("-created_at").first()
+    )
+
+    defaults = {
+        "title": title,
+        "type": chat_type or TelegramChat.ChatType.SUPERGROUP,
+        "added_by": actor_id,
+        # не «активируем» тут, статус уже рассчитан выше:
+        "status": status,
+        "can_invite_users": can_invite_users,
+        "join_by_request": join_by_request,
+    }
+    if intent:
+        defaults["project"] = intent.project
+
+    chat_obj, _ = TelegramChat.objects.update_or_create(tg_id=chat_id, defaults=defaults)
+    TelegramChat.objects.filter(pk=chat_obj.pk).update(last_synced_at=timezone.now())
+
+    if intent:
+        intent.mark_consumed(chat_id=chat_id)
+
+
+
+# ---------- helpers ----------
+
+def _find_active_intent_for_user(tg_user_id: int | None):
+    if not tg_user_id:
+        return None
+    return (ChatLinkIntent.objects
+            .filter(tg_user_id=tg_user_id,
+                    status=ChatLinkIntent.Status.PENDING,
+                    expires_at__gt=timezone.now())
+            .order_by("-created_at").first())
+
+
+def _find_active_intent_for_request(req_id: int | None):
+    if not req_id:
+        return None
+    return (ChatLinkIntent.objects
+            .filter(tg_request_id=req_id,
+                    status=ChatLinkIntent.Status.PENDING,
+                    expires_at__gt=timezone.now())
+            .order_by("-created_at").first())

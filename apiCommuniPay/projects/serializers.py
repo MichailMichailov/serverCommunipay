@@ -15,9 +15,7 @@ class ProjectMemberSerializer(serializers.ModelSerializer):
         fields = ["id", "user", "user_email", "user_name", "role", "joined_at","tg_id"]
         read_only_fields = ["id", "joined_at", "user_email", "user_name", "tg_id"]
     def get_tg_id(self, obj):
-        # Получаем telegram_id пользователя, связанного с членом проекта
         return obj.user.telegram_id if obj.user else None
-
 
 class ProjectSerializer(serializers.ModelSerializer):
     my_role = serializers.SerializerMethodField()

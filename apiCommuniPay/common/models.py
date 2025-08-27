@@ -1,30 +1,39 @@
-from django.db import models
-# apiCommuniPay/common/models.py
-from django.db import models
+import datetime as dt
+import secrets
+import string
+
 from django.conf import settings
-import secrets, string, datetime as dt
-from django.conf import settings
-from django.db import models
+from django.core.validators import MinValueValidator
+from django.db import IntegrityError, models, transaction
 from django.utils import timezone
-from django.contrib.auth import get_user_model
-
-User = get_user_model()
 
 
-def _short_token(n=10):
+def _short_token(n: int = 10) -> str:
     alphabet = string.ascii_letters + string.digits
-    return ''.join(secrets.choice(alphabet) for _ in range(n))
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
 
 class ChatLinkIntent(models.Model):
     """
-    Намерение привязать чат к проекту через deeplink.
-    Живёт короткое время. Склеивает:
-      - проект
-      - кто инициировал (user)
-      - какой телеграм-пользователь нажал /start
-      - request_id (для chat_shared)
-      - чат, который в итоге привязали
+    Интент (одноразовое намерение) привязать Telegram-чат к проекту.
+
+    Поток в двух словах:
+    1) Пользователь жмёт «Добавить канал/чат» → создаём интент (status=pending) и токен.
+    2) Юзер открывает бота: `/start <token>` → сохраняем tg_user_id у интента.
+    3) Из мини-аппы «поделиться чатом» → приходят chat_id и request_id → связываем с интентом.
+    4) Боту выдают права админа в чате → по my_chat_member → чат становится ACTIVE, интент consumed.
+
+    Главное про поля:
+    - project: к какому проекту подвязываем чат
+    - initiator: кто начал процесс в нашем сервисе (Django User)
+    - token: одноразовый код для /start
+    - tg_user_id: кто нажал /start в Telegram
+    - tg_request_id: request_id из chat_shared
+    - chat_id: выбранный чат (как только известен)
+    - status: pending | consumed | expired | cancelled
+    - expires_at: дедлайн действия токена
     """
+
     class Status(models.TextChoices):
         PENDING = "pending", "Ожидает"
         CONSUMED = "consumed", "Использовано"
@@ -32,73 +41,205 @@ class ChatLinkIntent(models.Model):
         CANCELLED = "cancelled", "Отменено"
 
     id = models.BigAutoField(primary_key=True)
-    project = models.ForeignKey("projects.Project", on_delete=models.CASCADE, related_name="link_intents")
-    initiator = models.ForeignKey(User, on_delete=models.CASCADE, related_name="link_intents")
-    token = models.CharField(max_length=64, unique=True, db_index=True)
-    tg_user_id = models.BigIntegerField(null=True, blank=True)        # кто нажал /start
-    tg_request_id = models.BigIntegerField(null=True, blank=True)     # request_id для chat_shared
-    chat_id = models.BigIntegerField(null=True, blank=True)           # итоговый chat.id
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
-    expires_at = models.DateTimeField()
-    created_at = models.DateTimeField(auto_now_add=True)
+    project = models.ForeignKey(
+        "projects.Project",
+        on_delete=models.CASCADE,
+        related_name="link_intents",
+    )
+    initiator = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="link_intents",
+    )
+    token = models.CharField(max_length=64, unique=True)
+    tg_user_id = models.PositiveBigIntegerField(
+        null=True, blank=True, db_index=True, validators=[MinValueValidator(1)]
+    )       # кто нажал /start
+    tg_request_id = models.PositiveBigIntegerField(
+        null=True, blank=True, db_index=True, validators=[MinValueValidator(1)]
+    )    # request_id для chat_shared
+    chat_id = models.PositiveBigIntegerField(
+        null=True, blank=True, db_index=True, validators=[MinValueValidator(1)]
+    )          # итоговый chat.id
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+    )
+    expires_at = models.DateTimeField(db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     consumed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "намерение привязки чата"
+        verbose_name_plural = "намерения привязки чатов"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status", "expires_at"], name="intent_status_exp"),
+            models.Index(fields=["tg_user_id", "status", "expires_at"], name="intent_user_status_exp"),
+            models.Index(fields=["tg_request_id", "status", "expires_at"], name="intent_req_status_exp"),
+        ]
+        constraints = [
+            # Если статус consumed, то consumed_at не NULL
+            models.CheckConstraint(
+                name="intent_consumed_has_ts",
+                check=(
+                    models.Q(status="consumed", consumed_at__isnull=False)
+                    | ~models.Q(status="consumed")
+                ),
+            ),
+            # Если есть consumed_at, то статус обязательно consumed
+            models.CheckConstraint(
+                name="intent_ts_means_consumed",
+                check=(models.Q(consumed_at__isnull=True) | models.Q(status="consumed")),
+            ),
+        ]
 
     @classmethod
     def create_for(cls, project, user, ttl_minutes: int = 15):
-        token = f"proj_{_short_token(16)}"
-        return cls.objects.create(
-            project=project,
-            initiator=user,
-            token=token,
-            expires_at=timezone.now() + dt.timedelta(minutes=ttl_minutes),
-        )
+        """
+        Создаёт новый интент для указанного проекта и инициатора.
 
-    def is_active(self):
+        :param project: Project, к которому будет привязан чат
+        :param user: Django-пользователь, инициатор
+        :param ttl_minutes: срок жизни токена (по умолчанию 15 минут)
+        :return: ChatLinkIntent c уникальным token и выставленным expires_at
+        """
+        for _ in range(5):
+            token = f"proj_{_short_token(16)}"
+            try:
+                with transaction.atomic():
+                    return cls.objects.create(
+                        project=project,
+                        initiator=user,
+                        token=token,
+                        expires_at=timezone.now() + dt.timedelta(minutes=ttl_minutes),
+                    )
+            except IntegrityError:
+                # пробуем ещё раз с другим токеном
+                continue
+        raise RuntimeError("Failed to generate unique token for ChatLinkIntent")
+
+    def is_active(self) -> bool:
+        """True, если интент ещё действителен: status=pending и expires_at в будущем."""
         return self.status == self.Status.PENDING and self.expires_at > timezone.now()
 
     def mark_consumed(self, chat_id: int):
-        self.chat_id = chat_id
-        self.status = self.Status.CONSUMED
-        self.consumed_at = timezone.now()
-        self.save(update_fields=["chat_id", "status", "consumed_at"])
+        """Помечает интент как использованный: сохраняет chat_id, status=consumed и consumed_at."""
+        now = timezone.now()
+        updated = (
+            ChatLinkIntent.objects
+            .filter(pk=self.pk, status=self.Status.PENDING)
+            .update(chat_id=chat_id, status=self.Status.CONSUMED, consumed_at=now)
+        )
+        if updated:
+            # синхронизируем локальный инстанс на всякий
+            self.chat_id = chat_id
+            self.status = self.Status.CONSUMED
+            self.consumed_at = now
+
+    def __str__(self) -> str:
+        return f"Intent({self.token}) → project={self.project_id} status={self.status}"
 
 
 class TelegramChat(models.Model):
+    """
+    Подключённый Telegram-чат/канал, связанный (или ещё связываемый) с проектом.
+
+    Что храним:
+    - tg_id: числовой ID чата (уникален)
+    - type: 'channel' | 'supergroup' | 'group' | 'private'
+    - title/username: человекочитаемые подписи
+    - project: проект, к которому привязан чат (может быть NULL до выдачи прав)
+    - status:
+        • pending_rights — нашли чат через chat_shared, но прав у бота ещё нет
+        • active          — бот админ, интеграция рабочая
+        • inactive        — бота удалили/понизили
+    - can_invite_users: у бота есть право приглашать/одобрять заявки
+    - join_by_request: в чате включён режим вступления по заявке
+    - added_by: Telegram-ID пользователя, который дал боту права
+    - last_synced_at: когда последний раз сверяли права/настройки
+
+    Жизненный цикл:
+    1) chat_shared → создаём/обновляем запись как PENDING_RIGHTS.
+    2) my_chat_member(administrator) → переводим в ACTIVE, (если был интент) — линкуем проект.
+    3) left/kicked/restricted/member → переводим в INACTIVE.
+    """
     class ChatType(models.TextChoices):
+        """Типы Telegram-чатов, которые поддерживаем."""
+
         CHANNEL = "channel", "Channel"
         SUPERGROUP = "supergroup", "Supergroup"
         GROUP = "group", "Group"
         PRIVATE = "private", "Private"
 
     class ChatStatus(models.TextChoices):
+        """Состояние подключения чата в нашей системе."""
+
         ACTIVE = "active", "Активен"
         PENDING_RIGHTS = "pending_rights", "Требуются права"
         INACTIVE = "inactive", "Неактивен"
 
     id = models.BigAutoField(primary_key=True)
-    tg_id = models.BigIntegerField(unique=True, db_index=True)
+    tg_id = models.BigIntegerField(
+        null=False,
+        blank=False,
+        unique=True,
+    )
     type = models.CharField(max_length=32, choices=ChatType.choices)
     title = models.CharField(max_length=256, blank=True, default="")
     username = models.CharField(max_length=256, blank=True, default="")
-    project = models.ForeignKey("projects.Project", on_delete=models.SET_NULL, null=True, blank=True,
-                                related_name="telegram_chats")
-    status = models.CharField(max_length=32, choices=ChatStatus.choices, default=ChatStatus.PENDING_RIGHTS)
-    added_by = models.BigIntegerField(null=True, blank=True)  # tg user id, кто привязал
+    project = models.ForeignKey(
+        "projects.Project",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="telegram_chats",
+    )
+    status = models.CharField(
+        max_length=32,
+        choices=ChatStatus.choices,
+        default=ChatStatus.PENDING_RIGHTS,
+        db_index=True,
+    )
+    added_by = models.PositiveBigIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])  # tg user id, кто привязал
     created_at = models.DateTimeField(auto_now_add=True)
 
-    def __str__(self):
+    # capability flags, синхронизируем из вебхука when possible
+    can_invite_users = models.BooleanField(default=False)  # у бота есть право приглашать/одобрять заявки
+    join_by_request = models.BooleanField(default=False)   # в чате включены заявки на вступление
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "телеграм-чат"
+        verbose_name_plural = "телеграм-чаты"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["project", "status"], name="tgchat_project_status"),
+        ]
+
+    def __str__(self) -> str:
         return f"{self.type}:{self.tg_id} {self.title or self.username}"
 
+
 class TimeStampedModel(models.Model):
+    """
+    Абстрактная база: два стандартных поля аудита — created_at и updated_at.
+    Подмешивайте в модели, где нужен единый учёт времени создания/обновления.
+    """
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         abstract = True
 
+
 class OwnedModel(models.Model):
     """
-    Ожидает поле owner = FK(User). Не абстрактная проверка — но класс сам абстрактный.
+    Абстрактная база для моделей с владельцем.
+    Предполагает наличие поля `owner = FK(User)` в наследнике и упрощает проверки доступа.
     """
+
     class Meta:
         abstract = True

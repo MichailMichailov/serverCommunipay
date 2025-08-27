@@ -133,7 +133,9 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 INSTALLED_APPS += ["rest_framework","corsheaders","apiCommuniPay.common","apiCommuniPay.api","apiCommuniPay.accounts","rest_framework_simplejwt.token_blacklist","apiCommuniPay.clubs","apiCommuniPay.projects"]
 MIDDLEWARE = ["corsheaders.middleware.CorsMiddleware", *MIDDLEWARE]
-ALLOWED_HOSTS = ["127.0.0.1", "localhost","communipay.ru", "www.communipay.ru", "api.communipay.ru"]
+# ALLOWED_HOSTS = ["127.0.0.1", "localhost","communipay.ru", "www.communipay.ru", "api.communipay.ru"]
+ALLOWED_HOSTS = ["*"]
+
 CORS_ALLOWED_ORIGINS = [
     "https://communipay.ru",          # фронт
     "https://www.communipay.ru",      # если будет редирект/альтернативный вход

@@ -33,11 +33,34 @@ class CreateLinkIntent(ProjectContextMixin, generics.GenericAPIView):
     serializer_class = ChatLinkIntentCreateSerializer
 
     def post(self, request, *args, **kwargs):
-        data = self.get_serializer(data=request.data)
-        data.is_valid(raise_exception=True)
-        ttl = data.validated_data["ttl_minutes"]
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        # ttl from payload (validated by serializer)
+        ttl = serializer.validated_data["ttl_minutes"]
+        # 1) создаём intent, в нём уже зафиксирован проект и инициатор
         intent = ChatLinkIntent.create_for(self.project, request.user, ttl_minutes=ttl)
-        start_link = f"https://t.me/{BOT_USERNAME}?start={intent.token}"
+
+        # 2) постараемся зафиксировать telegram user id того, кто начал привязку
+        #    a) из запроса (если фронт прислал)
+        #    b) из атрибутов пользователя (если у нас сохранён tg id после login)
+        tg_user_id = (
+            serializer.validated_data.get("tg_user_id")
+            if hasattr(serializer, "validated_data") else None
+        )
+        
+        if tg_user_id is None:
+            tg_user_id = (
+                getattr(request.user, "tg_user_id", None)
+                or getattr(request.user, "telegram_id", None)
+                or getattr(request.user, "tg_id", None)
+            )
+        if tg_user_id:
+            if intent.tg_user_id != tg_user_id:
+                intent.tg_user_id = tg_user_id
+                intent.save(update_fields=["tg_user_id"])
+        # 3) вернём данные для фронта; ссылка /start может не использоваться, но оставим для совместимости
+        start_link = f"https://t.me/{BOT_USERNAME}?start={intent.token}" if BOT_USERNAME else ""
         out = ChatLinkIntentResponseSerializer({
             "token": intent.token,
             "start_link": start_link,

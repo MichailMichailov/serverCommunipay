@@ -33,7 +33,7 @@ def healthz(_): return HttpResponse(status=204)
 # urls.py
 from django.contrib import admin
 from django.urls import path, include, re_path
-from django.views.generic import TemplateView
+from django.views.generic import TemplateView, RedirectView
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import never_cache
 # healthz как было
@@ -51,7 +51,7 @@ urlpatterns = [
     path("api/", include("apiCommuniPay.api.urls")),
     path("api/", include("apiCommuniPay.clubs.urls")),
     path("api/", include("apiCommuniPay.projects.urls")),
-    path("api/common/", include("apiCommuniPay.common.urls", namespace="common")),
+    path("api/common/", include(("apiCommuniPay.common.urls", "common"), namespace="common")),
     path("healthz", healthz),
     # healthchecks
     path("api/healthz", healthz, name="healthz"),
@@ -59,6 +59,7 @@ urlpatterns = [
 
     # админка
     path("admin/", admin.site.urls),
+    path("admin", RedirectView.as_view(url="/admin/", permanent=True)),
 
     # SPA на корень
     path("", SPAView.as_view(), name="spa"),
