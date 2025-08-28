@@ -1,8 +1,8 @@
-from rest_framework import decorators, response, status, permissions
+from rest_framework import decorators, status, permissions, generics
+from rest_framework.response import Response
 
 from django.conf import settings
 from django.shortcuts import get_object_or_404
-from rest_framework import generics, permissions, response
 from apiCommuniPay.projects.models import Project
 from .models import TelegramChat, ChatLinkIntent
 from .serializers import TelegramChatSerializer, ChatLinkIntentCreateSerializer, ChatLinkIntentResponseSerializer
@@ -13,7 +13,7 @@ BOT_USERNAME = getattr(settings, "TELEGRAM_BOT_USERNAME", "")
 @decorators.api_view(["GET"])
 @decorators.permission_classes([permissions.AllowAny])
 def healthz(_request):
-    return response.Response(status=status.HTTP_204_NO_CONTENT)
+    return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ProjectContextMixin:
@@ -38,32 +38,32 @@ class CreateLinkIntent(ProjectContextMixin, generics.GenericAPIView):
 
         # ttl from payload (validated by serializer)
         ttl = serializer.validated_data["ttl_minutes"]
-        # 1) создаём intent, в нём уже зафиксирован проект и инициатор
-        intent = ChatLinkIntent.create_for(self.project, request.user, ttl_minutes=ttl)
 
-        # 2) постараемся зафиксировать telegram user id того, кто начал привязку
-        #    a) из запроса (если фронт прислал)
-        #    b) из атрибутов пользователя (если у нас сохранён tg id после login)
+        # 2) определить Telegram user id инициатора (из payload или из профиля пользователя)
         tg_user_id = (
             serializer.validated_data.get("tg_user_id")
             if hasattr(serializer, "validated_data") else None
         )
-        
         if tg_user_id is None:
             tg_user_id = (
-                getattr(request.user, "tg_user_id", None)
-                or getattr(request.user, "telegram_id", None)
+                getattr(request.user, "telegram_id", None)
+                or getattr(request.user, "tg_user_id", None)
                 or getattr(request.user, "tg_id", None)
             )
-        if tg_user_id:
-            if intent.tg_user_id != tg_user_id:
-                intent.tg_user_id = tg_user_id
-                intent.save(update_fields=["tg_user_id"])
-        # 3) вернём данные для фронта; ссылка /start может не использоваться, но оставим для совместимости
+
+        # 1) создаём intent, в нём уже зафиксирован проект и инициатор
+        intent = ChatLinkIntent.create_for(
+            project=self.project,
+            user=request.user,
+            ttl_minutes=ttl,
+            tg_user_id=tg_user_id,
+        )
+
+        # 2) вернём данные для фронта; ссылка /start может не использоваться, но оставим для совместимости
         start_link = f"https://t.me/{BOT_USERNAME}?start={intent.token}" if BOT_USERNAME else ""
         out = ChatLinkIntentResponseSerializer({
             "token": intent.token,
             "start_link": start_link,
             "expires_at": intent.expires_at,
         })
-        return response.Response(out.data, status=201)
+        return Response(out.data, status=status.HTTP_201_CREATED)

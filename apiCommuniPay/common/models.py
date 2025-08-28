@@ -6,6 +6,7 @@ from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.db import IntegrityError, models, transaction
 from django.utils import timezone
+from django.db.models import Q, UniqueConstraint
 
 
 def _short_token(n: int = 10) -> str:
@@ -58,7 +59,7 @@ class ChatLinkIntent(models.Model):
     tg_request_id = models.PositiveBigIntegerField(
         null=True, blank=True, db_index=True, validators=[MinValueValidator(1)]
     )    # request_id для chat_shared
-    chat_id = models.PositiveBigIntegerField(
+    chat_id = models.BigIntegerField(
         null=True, blank=True, db_index=True, validators=[MinValueValidator(1)]
     )          # итоговый chat.id
     status = models.CharField(
@@ -81,6 +82,11 @@ class ChatLinkIntent(models.Model):
             models.Index(fields=["tg_request_id", "status", "expires_at"], name="intent_req_status_exp"),
         ]
         constraints = [
+            UniqueConstraint(
+                fields=["project", "initiator"],
+                condition=Q(status="pending"),
+                name="one_pending_intent_per_user_and_project",
+            ),
             # Если статус consumed, то consumed_at не NULL
             models.CheckConstraint(
                 name="intent_consumed_has_ts",
@@ -96,29 +102,73 @@ class ChatLinkIntent(models.Model):
             ),
         ]
 
-    @classmethod
-    def create_for(cls, project, user, ttl_minutes: int = 15):
-        """
-        Создаёт новый интент для указанного проекта и инициатора.
+    # внутри класса ChatLinkIntent (замените целиком метод create_for)
 
-        :param project: Project, к которому будет привязан чат
-        :param user: Django-пользователь, инициатор
-        :param ttl_minutes: срок жизни токена (по умолчанию 15 минут)
-        :return: ChatLinkIntent c уникальным token и выставленным expires_at
+    @classmethod
+    def create_for(
+            cls,
+            project,
+            user,
+            ttl_minutes: int = 15,
+            tg_user_id: int | None = None,
+    ):
         """
-        for _ in range(5):
-            token = f"proj_{_short_token(16)}"
-            try:
-                with transaction.atomic():
+        Гарантирует не более одного pending-интента на (project, initiator).
+        При повторном нажатии «добавить чат/канал» возвращает уже существующий,
+        продлевая срок действия и подставляя tg_user_id, если он появился.
+        Корректно обрабатывает гонки по уникальному ограничению.
+        """
+        now = timezone.now()
+        expires = now + dt.timedelta(minutes=ttl_minutes)
+
+        with transaction.atomic():
+            # 1) Пытаемся переиспользовать актуальный pending
+            existing = (
+                cls.objects
+                .select_for_update()
+                .filter(project=project, initiator=user, status=cls.Status.PENDING)
+                .order_by("-created_at")
+                .first()
+            )
+            if existing:
+                fields = []
+                if tg_user_id and not existing.tg_user_id:
+                    existing.tg_user_id = tg_user_id
+                    fields.append("tg_user_id")
+                if existing.expires_at < expires:
+                    existing.expires_at = expires
+                    fields.append("expires_at")
+                if fields:
+                    existing.save(update_fields=fields)
+                return existing
+
+            # 2) Pending ещё нет — создаём новый с уникальным token
+            for _ in range(8):  # достаточно, коллизии почти нереальны
+                token = f"proj_{_short_token(16)}"
+                try:
                     return cls.objects.create(
                         project=project,
                         initiator=user,
                         token=token,
-                        expires_at=timezone.now() + dt.timedelta(minutes=ttl_minutes),
+                        tg_user_id=tg_user_id,
+                        expires_at=expires,
                     )
-            except IntegrityError:
-                # пробуем ещё раз с другим токеном
-                continue
+                except IntegrityError as e:
+                    msg = str(e)
+                    # (a) конфликт токена — пробуем сгенерить другой
+                    if "token" in msg:
+                        continue
+                    # (b) гонка по уникальному индексу one_pending_intent_per_user_and_project — вернём существующий
+                    if "one_pending_intent_per_user_and_project" in msg:
+                        return (
+                            cls.objects
+                            .filter(project=project, initiator=user, status=cls.Status.PENDING)
+                            .order_by("-created_at")
+                            .first()
+                        )
+                    # (c) прочее — пробрасываем
+                    raise
+
         raise RuntimeError("Failed to generate unique token for ChatLinkIntent")
 
     def is_active(self) -> bool:
