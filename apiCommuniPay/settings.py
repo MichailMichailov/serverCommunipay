@@ -27,7 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = 'django-insecure-i%biq!y+=uja(i&06w$^vyit6_a70c*^+t2+t6p9c!j^=h@p1s'
-
+REDIS_URL = "redis://localhost:6379/0"
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 

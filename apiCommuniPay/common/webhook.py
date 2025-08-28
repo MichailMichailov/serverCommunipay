@@ -9,6 +9,8 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
+from apiCommuniPay.sse.publisher import send_sse_message
+
 from .models import ChatLinkIntent, TelegramChat
 
 _TELEGRAM_BOT_ID = getattr(settings, "TELEGRAM_BOT_ID", None)
@@ -278,6 +280,8 @@ def _link_chat_to_project(
     TelegramChat.objects.filter(pk=chat_obj.pk).update(last_synced_at=timezone.now())
 
     if intent:
+        payload = { "title":title, "type":chat_type or TelegramChat.ChatType.SUPERGROUP}
+        send_sse_message(intent.token, payload)
         logger.info("link_chat_to_project: consuming intent id=%s for chat_id=%s", intent.id, chat_id)
         intent.mark_consumed(chat_id=chat_id)
 

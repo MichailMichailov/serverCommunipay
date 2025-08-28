@@ -25,8 +25,6 @@ from apiCommuniPay.clubs.views import ChatAccessView
 from django.conf import settings
 from django.conf.urls.static import static
 
-
-
 def healthz(_): return HttpResponse(status=204)
 
 
@@ -52,6 +50,7 @@ urlpatterns = [
     path("api/", include("apiCommuniPay.clubs.urls")),
     path("api/", include("apiCommuniPay.projects.urls")),
     path("api/common/", include(("apiCommuniPay.common.urls", "common"), namespace="common")),
+    path("api/sse/", include("apiCommuniPay.sse.urls")),
     path("healthz", healthz),
     # healthchecks
     path("api/healthz", healthz, name="healthz"),
