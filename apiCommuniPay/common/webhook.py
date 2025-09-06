@@ -9,7 +9,7 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 
-# from apiCommuniPay.sse.views import send_message_to_token
+from apiCommuniPay.sse.views import send_message_to_token
 
 from .models import ChatLinkIntent, TelegramChat
 
@@ -282,7 +282,7 @@ def _link_chat_to_project(
     if intent:
         logger.info("link_chat_to_project: consuming intent id=%s for chat_id=%s", intent.id, chat_id)
         intent.mark_consumed(chat_id=chat_id)
-        # send_message_to_token(intent.token, json.dumps({"message": "msg"}))
+        send_message_to_token(intent.token, json.dumps({"message": "любые поля любого сообщения"}))
 
 
 
