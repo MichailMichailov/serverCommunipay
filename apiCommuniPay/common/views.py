@@ -1,3 +1,4 @@
+import json
 from rest_framework import decorators, response, status, permissions
 
 from django.conf import settings
@@ -7,7 +8,8 @@ from apiCommuniPay.projects.models import Project
 from .models import TelegramChat, ChatLinkIntent
 from .serializers import TelegramChatSerializer, ChatLinkIntentCreateSerializer, ChatLinkIntentResponseSerializer
 from .permissions import IsProjectOwner
-
+import threading
+from apiCommuniPay.sse.views import send_message_to_token
 BOT_USERNAME = getattr(settings, "TELEGRAM_BOT_USERNAME", "")
 
 @decorators.api_view(["GET"])
@@ -66,4 +68,17 @@ class CreateLinkIntent(ProjectContextMixin, generics.GenericAPIView):
             "start_link": start_link,
             "expires_at": intent.expires_at,
         })
+        # это только пример как слать 
+        # send_message_to_token(token, json.dumps({"message": message}))
+        # с начала шлю токен ретурном
+        # потом чере 5 секун сообщение для теста 
+        threading.Timer(5, send_delayed_message, 
+        args=(intent.token, "Hello after 5 seconds")).start()
+
         return response.Response(out.data, status=201)
+def send_delayed_message(token, message):
+    """
+    Отправка сообщения через SSE клиенту с токеном token
+    """
+    # message должен быть сериализован в JSON
+    send_message_to_token(token, json.dumps({"message": message}))
